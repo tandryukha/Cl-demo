@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Compile Labs – Client-Side Model Router Demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; background:#0b1020; color:#e8f0ff; }
+    header { padding:16px 20px; border-bottom:1px solid #22305a; }
+    h1 { margin:0 0 6px; font-size:18px; }
+    .hint { color:#8aa0c7; font-size:12px; }
+
+    main { padding:20px; display:grid; grid-template-columns:420px 1fr; gap:16px; }
+    @media (max-width: 900px){ main{ grid-template-columns:1fr; } }
+
+    .card { background:#121a33; border:1px solid #22305a; border-radius:12px; padding:14px; }
+    label { font-size:12px; color:#8aa0c7; display:block; margin:10px 0 6px; }
+    input, select, textarea {
+      width:100%; box-sizing:border-box; padding:10px; border-radius:10px;
+      border:1px solid #22305a; background:#0c1430; color:#e8f0ff;
+    }
+    textarea { min-height:120px; resize:vertical; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px; }
+    button { padding:10px 12px; border-radius:10px; border:1px solid #22305a; background:#0c1430; color:#e8f0ff; cursor:pointer; }
+    button.primary { background:#1a2a57; }
+    button:hover { filter:brightness(1.08); }
+    .row { display:flex; gap:10px; margin-top:10px; flex-wrap:wrap; }
+    .status { font-size:12px; color:#8aa0c7; margin-top:8px; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid #22305a; font-size:11px; }
+    .ok { color:#33d17a; }
+    .bad { color:#ff6b6b; }
+
+    table { width:100%; border-collapse:collapse; font-size:12px; margin-top:10px; }
+    th, td { padding:6px 8px; border-bottom:1px solid #22305a; text-align:left; }
+    th { color:#8aa0c7; font-weight:500; }
+    pre { white-space:pre-wrap; word-break:break-word; font-size:12px; margin:0; }
+    .tiny { font-size:11px; color:#8aa0c7; }
+    .warn { color:#ffd36b; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Compile Labs – Client-Side Model Router</h1>
+  <div class="hint">
+    Static page. User pastes their own API key. No server. No key in source.
+  </div>
+</header>
+
+<main>
+  <div class="card">
+    <label>Base URL</label>
+    <input id="baseUrl" value="https://api.compilelabs.com" />
+
+    <label>API Key (user-provided)</label>
+    <input id="apiKey" placeholder="Paste key (stored per your chosen mode)" />
+
+    <label>Key storage mode</label>
+    <select id="keyMode">
+      <option value="memory" selected>Session only (memory) – cleared on refresh</option>
+      <option value="local">Persist (localStorage) – stays until cleared</option>
+    </select>
+    <div class="tiny warn">If you choose localStorage, the key remains in this browser until you clear it.</div>
+
+    <div class="row">
+      <button class="primary" id="saveKey">Save key</button>
+      <button id="clearKey">Clear key</button>
+      <button id="testKey">Test key (GET /v1/models)</button>
+    </div>
+
+    <hr style="border:none;border-top:1px solid #22305a;margin:14px 0;">
+
+    <label>Routing intent</label>
+    <select id="intent">
+      <option value="cheap">cheap</option>
+      <option value="fast">fast</option>
+      <option value="balanced" selected>balanced</option>
+      <option value="best">best_quality</option>
+    </select>
+
+    <label>User prompt</label>
+    <textarea id="prompt">Explain model routing in one paragraph.</textarea>
+
+    <div class="row">
+      <button class="primary" id="loadModels">Load models</button>
+      <button id="runChat">Run chat</button>
+    </div>
+
+    <div class="status" id="status">Idle</div>
+  </div>
+
+  <div class="card">
+    <label>Router decision</label>
+    <div id="decision" class="pill">—</div>
+
+    <label>Models (from /v1/models)</label>
+    <table id="modelsTable">
+      <thead>
+        <tr>
+          <th>model</th>
+          <th>ctx</th>
+          <th>input $</th>
+          <th>output $</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <label>Chat response</label>
+    <pre id="response"></pre>
+  </div>
+</main>
+
+<script>
+  // In-memory key (session-only)
+  let sessionKey = null;
+
+  const LS_KEY = "compile_router_demo_api_key";
+
+  const $ = (id) => document.getElementById(id);
+  const setStatus = (msg) => $("status").textContent = msg;
+
+  function getKey() {
+    const mode = $("keyMode").value;
+    if (mode === "memory") return sessionKey;
+    return localStorage.getItem(LS_KEY);
+  }
+
+  function setKey(key) {
+    const mode = $("keyMode").value;
+    if (mode === "memory") {
+      sessionKey = key;
+      // ensure localStorage is not accidentally used
+      localStorage.removeItem(LS_KEY);
+    } else {
+      localStorage.setItem(LS_KEY, key);
+      sessionKey = null;
+    }
+  }
+
+  function clearKey() {
+    sessionKey = null;
+    localStorage.removeItem(LS_KEY);
+    $("apiKey").value = "";
+  }
+
+  function authHeaders() {
+    const key = getKey();
+    if (!key) return {};
+    return { "Authorization": "Bearer " + key };
+  }
+
+  let models = [];
+
+  function renderModels() {
+    const tbody = document.querySelector("#modelsTable tbody");
+    tbody.innerHTML = "";
+    models.forEach(m => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${m.id}</td>
+        <td>${m.context_length ?? "?"}</td>
+        <td>${m.pricing?.input ?? "?"}</td>
+        <td>${m.pricing?.output ?? "?"}</td>
+      `;
+      tbody.appendChild(tr);
+    });
+  }
+
+  // Very simple client-side router score
+  function pickModel(intent) {
+    if (!models.length) return null;
+
+    const scored = models.map(m => {
+      const inP = Number(m.pricing?.input ?? 0);
+      const outP = Number(m.pricing?.output ?? 0);
+      const cost = inP + outP;
+      const ctx = Number(m.context_length ?? 0);
+
+      let score = 0;
+      if (intent === "cheap") score = -cost;
+      if (intent === "fast") score = -cost - ctx * 0.0001;          // bias against huge ctx
+      if (intent === "balanced") score = ctx * 0.001 - cost;        // tradeoff
+      if (intent === "best") score = ctx * 0.01;                    // naive proxy for capability
+
+      return { model: m, score };
+    });
+
+    scored.sort((a,b) => b.score - a.score);
+    return scored[0]?.model ?? null;
+  }
+
+  async function fetchJson(path) {
+    const base = $("baseUrl").value.trim().replace(/\/+$/, "");
+    const url = base + path;
+    const res = await fetch(url, { headers: { ...authHeaders() } });
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); } catch { json = { raw: text }; }
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}: ${text}`);
+    return json;
+  }
+
+  async function loadModels() {
+    setStatus("Loading models…");
+    if (!getKey()) { alert("Paste key → Save key first."); return; }
+
+    // docs example uses type=text_to_text
+    const json = await fetchJson("/v1/models?type=text_to_text");
+    models = json.data || [];
+    renderModels();
+    setStatus(`Loaded ${models.length} models`);
+  }
+
+  async function testKey() {
+    setStatus("Testing key…");
+    if (!getKey()) { alert("Paste key → Save key first."); return; }
+    try {
+      const json = await fetchJson("/v1/models?type=text_to_text");
+      setStatus(`OK. Models: ${(json.data || []).length}`);
+    } catch (e) {
+      setStatus("Key test failed");
+      alert(String(e));
+    }
+  }
+
+  async function runChat() {
+    setStatus("Routing + calling chat…");
+    if (!getKey()) { alert("Paste key → Save key first."); return; }
+    if (!models.length) { alert("Load models first."); return; }
+
+    const intent = $("intent").value;
+    const chosen = pickModel(intent);
+    if (!chosen) { alert("No model chosen."); return; }
+
+    $("decision").textContent = `Picked: ${chosen.id}`;
+    $("decision").className = "pill ok";
+
+    const base = $("baseUrl").value.trim().replace(/\/+$/, "");
+    const res = await fetch(base + "/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        ...authHeaders(),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: chosen.id,
+        messages: [{ role: "user", content: $("prompt").value }]
+      })
+    });
+
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); } catch { json = { raw: text }; }
+
+    $("response").textContent = JSON.stringify(json, null, 2);
+    setStatus(res.ok ? "Done" : "Completed with error");
+    if (!res.ok) $("decision").className = "pill bad";
+  }
+
+  // UI handlers
+  $("saveKey").onclick = () => {
+    const key = $("apiKey").value.trim();
+    if (!key) { alert("Paste a key first."); return; }
+    setKey(key);
+    $("apiKey").value = ""; // wipe field after saving
+    setStatus($("keyMode").value === "local" ? "Key saved to localStorage." : "Key saved in memory (session only).");
+  };
+
+  $("clearKey").onclick = () => { clearKey(); setStatus("Key cleared."); };
+  $("testKey").onclick = () => testKey();
+  $("loadModels").onclick = () => loadModels();
+  $("runChat").onclick = () => runChat();
+
+  // On load: if localStorage has a key, show status only (do not auto-fill)
+  if (localStorage.getItem(LS_KEY)) {
+    setStatus("A key is stored in localStorage. You can Test key / Load models, or Clear key.");
+    $("keyMode").value = "local";
+  }
+</script>
+</body>
+</html>
